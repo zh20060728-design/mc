@@ -1,208 +1,215 @@
-import pandas as pd
 import numpy as np
+import pandas as pd
 
-# ======================
-# 📊 指标函数
-# ======================
 
-def EMA(series, period):
+def ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
 
-def ATR(df, period=14):
-    high_low = df['high'] - df['low']
-    high_close = np.abs(df['high'] - df['close'].shift())
-    low_close = np.abs(df['low'] - df['close'].shift())
+
+def atr(df, period=14):
+    high_low = df["high"] - df["low"]
+    high_close = (df["high"] - df["close"].shift(1)).abs()
+    low_close = (df["low"] - df["close"].shift(1)).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     return tr.rolling(period).mean()
 
-def ADX(df, period=14):
-    high = df['high']
-    low = df['low']
-    close = df['close']
 
-    plus_dm = high.diff()
-    minus_dm = low.diff().abs()
+def prepare_ohlcv(df):
+    df = df.copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=["timestamp", "open", "high", "low", "close", "volume"])
+    df = df.sort_values("timestamp").reset_index(drop=True)
+    return df
 
-    plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0)
-    minus_dm = np.where((minus_dm > plus_dm) & (minus_dm > 0), minus_dm, 0)
 
-    tr = pd.concat([
-        high - low,
-        abs(high - close.shift()),
-        abs(low - close.shift())
-    ], axis=1).max(axis=1)
+def build_4h_from_15m(df_15m):
+    temp = df_15m.set_index("timestamp")[["open", "high", "low", "close", "volume"]]
+    df_4h = (
+        temp.resample("4H")
+        .agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
+        .dropna()
+        .reset_index()
+    )
+    return df_4h
 
-    atr = tr.rolling(period).mean()
 
-    plus_di = 100 * (pd.Series(plus_dm).rolling(period).mean() / atr)
-    minus_di = 100 * (pd.Series(minus_dm).rolling(period).mean() / atr)
+def trendline_value(series, idx_start, idx_end, target_idx):
+    x = np.arange(idx_start, idx_end)
+    y = series.iloc[idx_start:idx_end].values
+    if len(x) < 2:
+        return np.nan
+    slope, intercept = np.polyfit(x, y, 1)
+    return slope * target_idx + intercept
 
-    dx = abs(plus_di - minus_di) / (plus_di + minus_di) * 100
-    return dx.rolling(period).mean()
 
-# ======================
-# 📊 策略核心（15m + 4H）
-# ======================
+def in_eu_or_us_session(ts):
+    # UTC时间下，简化欧盘/美盘过滤
+    hour = ts.hour
+    eu = 7 <= hour <= 15
+    us = 13 <= hour <= 22
+    return eu or us
 
-def generate_signals(df, df_4h):
 
-    # === 时间处理 ===
-    df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
-    df_4h['timestamp'] = pd.to_datetime(df_4h['timestamp'], errors='coerce')
+def generate_signals(df_15m, df_4h):
+    df_15m = prepare_ohlcv(df_15m)
+    df_4h = prepare_ohlcv(df_4h)
 
-    df = df.dropna()
-    df_4h = df_4h.dropna()
+    # 4H趋势：EMA50 与 EMA200
+    df_4h["ema50"] = ema(df_4h["close"], 50)
+    df_4h["ema200"] = ema(df_4h["close"], 200)
 
-    # === 转数值 ===
-    for col in ['open','high','low','close','volume']:
-        df[col] = pd.to_numeric(df[col], errors='coerce')
-        df_4h[col] = pd.to_numeric(df_4h[col], errors='coerce')
+    # 15M指标
+    df_15m["ema50"] = ema(df_15m["close"], 50)
+    df_15m["atr14"] = atr(df_15m, 14)
+    df_15m["atr_mean_50"] = df_15m["atr14"].rolling(50).mean()
+    df_15m["vol_ma20"] = df_15m["volume"].rolling(20).mean()
 
-    # === 指标 ===
-    df['ema20'] = EMA(df['close'], 20)
-    df['atr'] = ATR(df)
-    df['adx'] = ADX(df)
-
-    df_4h['ema50'] = EMA(df_4h['close'], 50)
+    # 挂接最近4H趋势到15M
+    trend_cols = df_4h[["timestamp", "ema50", "ema200"]].sort_values("timestamp")
+    df = pd.merge_asof(
+        df_15m.sort_values("timestamp"),
+        trend_cols,
+        on="timestamp",
+        direction="backward",
+        suffixes=("", "_4h"),
+    )
 
     signals = []
+    position = None
 
-    in_position = False
-    entry_price = 0
-    stop_loss = 0
-    take_profit = 0
+    for i in range(220, len(df)):
+        row = df.iloc[i]
 
-    loss_streak = 0
-
-    for i in range(100, len(df)):
-
-        # 🔥 连亏保护
-        if loss_streak >= 3:
+        # 过滤：欧盘/美盘
+        if not in_eu_or_us_session(row["timestamp"]):
             continue
 
-        current = df.iloc[i]
-        prev = df.iloc[i-1]
-
-        # ======================
-        # 🔥 4H趋势过滤（更强）
-        # ======================
-        current_time = current['timestamp']
-        df_4h_match = df_4h[df_4h['timestamp'] <= current_time]
-
-        if len(df_4h_match) < 50:
+        # 过滤：ATR太低不做（当前ATR需大于自身50均值）
+        if np.isnan(row["atr14"]) or np.isnan(row["atr_mean_50"]) or row["atr14"] < row["atr_mean_50"]:
             continue
 
-        last_4h = df_4h_match.iloc[-1]
-        prev_4h = df_4h_match.iloc[-3]
-
-        if last_4h['ema50'] < prev_4h['ema50']:
+        # 过滤：成交量阈值
+        if np.isnan(row["vol_ma20"]) or row["volume"] <= row["vol_ma20"] * 1.2:
             continue
 
-        # ======================
-        # 🔥 15m策略
-        # ======================
+        # 4H方向判断
+        trend = "none"
+        if row["ema50_4h"] > row["ema200_4h"]:
+            trend = "long"
+        elif row["ema50_4h"] < row["ema200_4h"]:
+            trend = "short"
 
-        if current['adx'] < 20:
+        if trend == "none":
             continue
 
-        # 趋势
-        if current['ema20'] < df.iloc[i-10]['ema20']:
-            continue
+        if position is None:
+            lookback = 30
+            start = i - lookback
 
-        # ATR过滤（避免震荡）
-        if abs(current['close'] - current['ema20']) < current['atr'] * 0.3:
-            continue
+            # 第二步：结构线（long用下降趋势线，short用上升趋势线）
+            if trend == "long":
+                line_prev = trendline_value(df["high"], start, i, i - 1)
+                line_now = trendline_value(df["high"], start, i, i)
 
-        # 突破（更宽）
-        recent_high = df.iloc[i-30:i]['high'].max()
-        breakout = current['high'] > recent_high + current['atr'] * 0.2
-
-        # 区间位置过滤🔥
-        recent_low = df.iloc[i-30:i]['low'].min()
-        mid = (recent_high + recent_low) / 2
-        if current['close'] < mid:
-            continue
-
-        # 回踩（更宽）
-        pullback = df.iloc[i-5:i]['low'].min() <= current['ema20'] * 1.03
-
-        # 确认K线
-        confirm = prev['close'] > prev['open']
-
-        # 强度
-        body = abs(current['close'] - current['open'])
-        range_ = current['high'] - current['low']
-        strong = body > range_ * 0.3
-
-        if current['close'] < current['open']:
-            continue
-
-        # ======================
-        # 🚀 入场
-        # ======================
-        if breakout and pullback and confirm and strong:
-
-            if not in_position:
-
-                entry_price = current['close']
-                atr = current['atr']
-
-                if np.isnan(atr):
+                breakout = df.iloc[i - 1]["close"] <= line_prev and row["close"] > line_now
+                if not breakout:
                     continue
 
-                stop_loss = entry_price - 1.2 * atr
-                take_profit = entry_price + 3 * (entry_price - stop_loss)
+                # 第三步：回踩趋势线 or EMA50 且不破（检查最近5根）
+                pulled = False
+                for j in range(i - 5, i + 1):
+                    lv = trendline_value(df["high"], start, i, j)
+                    touched_line = df.iloc[j]["low"] <= lv and df.iloc[j]["close"] >= lv
+                    touched_ema = df.iloc[j]["low"] <= df.iloc[j]["ema50"] and df.iloc[j]["close"] >= df.iloc[j]["ema50"]
+                    if touched_line or touched_ema:
+                        pulled = True
+                        break
+                if not pulled:
+                    continue
 
-                in_position = True
-                print(f"🟢 开仓: {entry_price}")
+                # 第四步：再次突破前高 + 放量
+                prior_high = df.iloc[i - 10 : i]["high"].max()
+                if row["close"] <= prior_high:
+                    continue
 
-        # ======================
-        # 📉 持仓管理
-        # ======================
-        if in_position:
+                entry = row["close"]
+                stop = df.iloc[i - 5 : i + 1]["low"].min()  # 回踩低点
+                risk = entry - stop
+                if risk <= 0:
+                    continue
+                tp = entry + 2 * risk  # 2R
+                position = {"side": "long", "entry": entry, "stop": stop, "tp": tp, "entry_time": row["timestamp"]}
 
-            # 保本
-            if current['close'] > entry_price + (entry_price - stop_loss):
-                stop_loss = entry_price
+            elif trend == "short":
+                line_prev = trendline_value(df["low"], start, i, i - 1)
+                line_now = trendline_value(df["low"], start, i, i)
 
-            if current['low'] <= stop_loss:
-                signals.append(("LOSS", stop_loss))
-                print("🔴 止损")
-                in_position = False
-                loss_streak += 1
+                breakout = df.iloc[i - 1]["close"] >= line_prev and row["close"] < line_now
+                if not breakout:
+                    continue
 
-            elif current['high'] >= take_profit:
-                signals.append(("WIN", take_profit))
-                print("🟢 止盈")
-                in_position = False
-                loss_streak = 0
+                pulled = False
+                for j in range(i - 5, i + 1):
+                    lv = trendline_value(df["low"], start, i, j)
+                    touched_line = df.iloc[j]["high"] >= lv and df.iloc[j]["close"] <= lv
+                    touched_ema = df.iloc[j]["high"] >= df.iloc[j]["ema50"] and df.iloc[j]["close"] <= df.iloc[j]["ema50"]
+                    if touched_line or touched_ema:
+                        pulled = True
+                        break
+                if not pulled:
+                    continue
+
+                prior_low = df.iloc[i - 10 : i]["low"].min()
+                if row["close"] >= prior_low:
+                    continue
+
+                entry = row["close"]
+                stop = df.iloc[i - 5 : i + 1]["high"].max()
+                risk = stop - entry
+                if risk <= 0:
+                    continue
+                tp = entry - 2 * risk
+                position = {"side": "short", "entry": entry, "stop": stop, "tp": tp, "entry_time": row["timestamp"]}
+
+        else:
+            side = position["side"]
+            if side == "long":
+                if row["low"] <= position["stop"]:
+                    signals.append({**position, "exit": position["stop"], "result": "LOSS", "exit_time": row["timestamp"]})
+                    position = None
+                elif row["high"] >= position["tp"]:
+                    signals.append({**position, "exit": position["tp"], "result": "WIN", "exit_time": row["timestamp"]})
+                    position = None
+            else:
+                if row["high"] >= position["stop"]:
+                    signals.append({**position, "exit": position["stop"], "result": "LOSS", "exit_time": row["timestamp"]})
+                    position = None
+                elif row["low"] <= position["tp"]:
+                    signals.append({**position, "exit": position["tp"], "result": "WIN", "exit_time": row["timestamp"]})
+                    position = None
 
     return signals
 
-# ======================
-# 📊 回测
-# ======================
 
 def backtest(signals):
-    wins = sum(1 for s in signals if s[0] == "WIN")
-    losses = sum(1 for s in signals if s[0] == "LOSS")
+    wins = sum(1 for s in signals if s["result"] == "WIN")
+    losses = sum(1 for s in signals if s["result"] == "LOSS")
     total = len(signals)
+    win_rate = (wins / total * 100) if total else 0
 
-    win_rate = wins / total * 100 if total > 0 else 0
-
-    print(f"\n总交易次数: {total}")
+    print(f"总交易次数: {total}")
     print(f"盈利次数: {wins}")
     print(f"亏损次数: {losses}")
     print(f"胜率: {win_rate:.2f}%")
 
-# ======================
-# 🚀 主程序
-# ======================
 
 if __name__ == "__main__":
+    # 默认用15m.csv，4H由15m重采样得到，满足双周期回测
+    df_15m = pd.read_csv("15m.csv")
+    df_15m = prepare_ohlcv(df_15m)
+    df_4h = build_4h_from_15m(df_15m)
 
-    df = pd.read_csv("btc_4h_202501-06.csv")
-    df_4h = pd.read_csv("btc_4h_202501-06.csv")
-
-    signals = generate_signals(df, df_4h)
-    backtest(signals)
+    trade_signals = generate_signals(df_15m, df_4h)
+    backtest(trade_signals)
